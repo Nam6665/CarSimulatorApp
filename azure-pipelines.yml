@@ -1,0 +1,129 @@
+trigger:
+  branches:
+    include:
+      - master
+      - feature/*
+
+pr:
+  branches:
+    include:
+      - master
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  - name: buildConfiguration
+    value: 'Release'
+  - name: dotnetVersion
+    value: '9.0.x'
+  - name: testResultsDir
+    value: '$(Agent.TempDirectory)/TestResults'
+  - name: artifactName
+    value: 'drop'
+
+stages:
+# BUILD
+- stage: Build
+  displayName: Build
+  jobs:
+  - job: Build
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        packageType: sdk
+        version: $(dotnetVersion)
+    - task: DotNetCoreCLI@2
+      displayName: Restore
+      inputs:
+        command: restore
+        projects: '**/*.sln'
+    - task: DotNetCoreCLI@2
+      displayName: Build (analyzers + warnings as errors)
+      inputs:
+        command: build
+        projects: '**/*.sln'
+        arguments: >-
+          --configuration $(buildConfiguration)
+          /p:TreatWarningsAsErrors=true
+          /p:EnableNETAnalyzers=true
+          /p:AnalysisLevel=latest
+          --no-restore
+
+# TEST
+- stage: Test
+  displayName: Test
+  dependsOn: Build
+  jobs:
+  - job: Test
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        packageType: sdk
+        version: $(dotnetVersion)
+    - task: DotNetCoreCLI@2
+      displayName: Run tests
+      inputs:
+        command: test
+        projects: 'CarSimulatorApp.Tests/CarSimulatorApp.Tests.csproj'
+        arguments: >-
+          --configuration $(buildConfiguration)
+          --logger "trx;LogFileName=tests.trx"
+    - task: PublishTestResults@2
+      displayName: Publish test results
+      inputs:
+        testResultsFormat: 'VSTest'
+        testResultsFiles: '$(Agent.TempDirectory)/**/*.trx'
+        failTaskOnFailedTests: true
+
+# PUBLISH
+- stage: Publish
+  displayName: Publish
+  dependsOn: Test
+  jobs:
+  - job: Publish
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        packageType: sdk
+        version: $(dotnetVersion)
+
+    - task: CmdLine@2
+      displayName: dotnet publish
+      inputs:
+        script: dotnet publish ./CarSimulator.Server/CarSimulator.Server.csproj -c $(buildConfiguration) -o $(Build.ArtifactStagingDirectory)
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish artifact
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifact: '$(artifactName)'
+
+# DEPLOY
+- stage: Deploy
+  displayName: Deploy
+  dependsOn: Publish
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'), ne(variables['Build.Reason'], 'PullRequest'))
+  jobs:
+  - job: Deploy
+    displayName: Deploy to Azure Web App
+    steps:
+
+    - download: current
+      artifact: $(artifactName)
+
+    - task: ArchiveFiles@2
+      displayName: Zip published site
+      inputs:
+        rootFolderOrFile: '$(Pipeline.Workspace)/$(artifactName)'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/site.zip'
+        replaceExistingArchive: true
+    - task: AzureRmWebAppDeployment@5
+      displayName: Deploy (Windows)
+      inputs:
+        azureSubscription: 'azurejensen069(a6c77128-996c-4422-9d42-bfc7c29a2255)'
+        appType: 'webapp'
+        WebAppName: 'CarSimApplication'
+        package: '$(Build.ArtifactStagingDirectory)/site.zip'
